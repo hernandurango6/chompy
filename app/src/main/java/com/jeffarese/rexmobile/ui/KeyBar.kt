@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.KeyboardHide
@@ -117,6 +118,7 @@ fun keyBarLabel(id: String): String = KEYS_BY_ID[id]?.let { k -> k.description?.
  * put at the start; the rest scroll.
  * Without [shiftTab] the bar leaves out Shift+Tab, as when the Claude strip's mode chip sends it.
  * With [onToggleStrip], a button beside the keyboard's shows or hides Claude's strip.
+ * With [onAttach], a button beside them attaches a gallery image, dimmed with the keys.
  * Unless [enabled], as while the screen isn't known to be current, the keys are dimmed and send
  * nothing; the keyboard and strip buttons still work.
  */
@@ -130,6 +132,7 @@ fun KeyBar(
     keys: List<String> = KEY_BAR_IDS,
     stripShown: Boolean = false,
     onToggleStrip: (() -> Unit)? = null,
+    onAttach: (() -> Unit)? = null,
     enabled: Boolean = true,
 ) {
     val haptics = rememberViewHaptics()
@@ -179,6 +182,11 @@ fun KeyBar(
         ) {
             rest.forEach { cap(it) }
             Spacer(Modifier.width(4.dp))
+        }
+        if (onAttach != null) {
+            IconButton(onClick = onAttach, enabled = enabled) {
+                Icon(Icons.Outlined.AttachFile, "Attach an image", tint = if (enabled) Rex.text else Rex.textDim)
+            }
         }
         if (onToggleStrip != null) {
             IconButton(onClick = onToggleStrip) {

@@ -22,6 +22,7 @@ import com.jeffarese.rexmobile.rex.TERMINAL_CREATOR
 import com.jeffarese.rexmobile.rex.TERMINAL_SUBPROTOCOL
 import com.jeffarese.rexmobile.rex.TicketResult
 import com.jeffarese.rexmobile.rex.TitleResult
+import com.jeffarese.rexmobile.rex.UploadTicket
 import com.jeffarese.rexmobile.rex.Welcome
 import com.jeffarese.rexmobile.rex.long
 import com.jeffarese.rexmobile.rex.obj
@@ -55,6 +56,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.OkHttpClient
+import java.util.UUID
 
 enum class ConnStatus { IDLE, CONNECTING, ONLINE, OFFLINE }
 
@@ -163,6 +165,10 @@ class HostConnection(
     /** How many times the control connection was lost while wanted, such as when the network changed. */
     val drops: StateFlow<Int> = _drops
 
+    /** The API revision the current connection agreed on, null on older servers and while none is open. */
+    @Volatile var apiRevision: Int? = null
+        private set
+
     private var conn: ControlConnection? = null
     private var reconnectToken: String? = null
     private var reconnectJob: Job? = null
@@ -199,6 +205,7 @@ class HostConnection(
             conn?.close()
             conn = null
             reconnectToken = null
+            apiRevision = null
             _state.update { it.copy(status = ConnStatus.IDLE) }
         }
     }
@@ -280,6 +287,7 @@ class HostConnection(
 
     private suspend fun onWelcome(c: ControlConnection, welcome: Welcome) {
         reconnectToken = welcome.reconnectToken
+        apiRevision = welcome.revision
         if (!answered && urlIndex != 0) onMoved(urls[urlIndex])
         answered = true
         try {
@@ -327,6 +335,7 @@ class HostConnection(
         // Never answered there, so the next attempt tries the next address.
         if (!answered) urlIndex = (urlIndex + 1) % urls.size
         conn = null
+        apiRevision = null
         if (wanted) _drops.update { it + 1 }
         _state.update { it.copy(status = if (wanted) ConnStatus.OFFLINE else ConnStatus.IDLE, error = reason.takeIf { r -> r.isNotBlank() && wanted }) }
         if (!wanted) return
@@ -618,6 +627,24 @@ class HostConnection(
         })
         return RexJson.decodeFromJsonElement<TicketResult>(r).ticket
     }
+
+    /**
+     * A ticket for a [com.jeffarese.rexmobile.rex.BYTES_SUBPROTOCOL] stream that uploads [size]
+     * bytes named [name] to the block's host, which types the path it lands at into the block's
+     * terminal. Servers before API revision 11 answer `method_not_found`, one over 100 MiB
+     * `too_large`. [batch], [index] and [count] group a multi-file upload.
+     */
+    suspend fun uploadBegin(sid: String, bid: String, name: String, size: Long, batch: String? = null, index: Int? = null, count: Int? = null): UploadTicket =
+        RexJson.decodeFromJsonElement(call("$TERMINAL_CREATOR.upload_begin", blockPayload(sid, bid, buildJsonObject {
+            put("ref", "upload:${UUID.randomUUID().toString().lowercase()}")
+            put("name", name)
+            put("size", size)
+            if (batch != null) {
+                put("batch", batch)
+                if (index != null) put("index", index)
+                if (count != null) put("count", count)
+            }
+        })))
 
     fun markSeen(bid: String) {
         scope.launch(serial) {

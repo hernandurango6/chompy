@@ -4,11 +4,16 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.view.KeyEvent
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -87,6 +92,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -128,6 +134,7 @@ import androidx.compose.ui.zIndex
 import com.jeffarese.rexmobile.model.AppModel
 import com.jeffarese.rexmobile.model.BlockMeta
 import com.jeffarese.rexmobile.model.ConnStatus
+import com.jeffarese.rexmobile.model.ImageUpload
 import com.jeffarese.rexmobile.model.KeepScreenOn
 import com.jeffarese.rexmobile.rex.ProgramStatus
 import com.jeffarese.rexmobile.rex.StreamState
@@ -142,14 +149,17 @@ import com.jeffarese.rexmobile.terminal.ScreenInfo
 import com.jeffarese.rexmobile.terminal.ScreenPrompt
 import com.jeffarese.rexmobile.terminal.SurveyAnswer
 import com.jeffarese.rexmobile.terminal.TerminalViewport
+import java.io.ByteArrayInputStream
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.max
 import kotlin.math.min
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val NO_INFO = MutableStateFlow(ScreenInfo())
 private val NOT_LAGGED = MutableStateFlow(false)
@@ -203,6 +213,45 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
         }
     }
     fun newTab() = open("Opening a tab…", "open a tab", { conn.newWindow(sid) }) { windowId = it }
+
+    // An image on its way to the pane, as the pill says it. The server types the saved path itself once it has it.
+    var uploading by remember { mutableStateOf<String?>(null) }
+    // The picker's answer lands after the photo is chosen, when the pane may be another, so what it
+    // needs is read then.
+    val pickBlockId = rememberUpdatedState(blockId)
+    val pickConn = rememberUpdatedState(conn)
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val bid = pickBlockId.value
+        if (uri != null && bid != null && uploading == null) {
+            scope.launch {
+                val file = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }?.let { imageName(context, uri) to it }
+                }
+                if (file == null) {
+                    Toast.makeText(context, "Couldn't read the image", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                val (name, bytes) = file
+                val stream = ByteArrayInputStream(bytes)
+                uploading = "Uploading image…"
+                try {
+                    val result = model.imageUpload(pickConn.value).upload(
+                        sid, bid, name, bytes.size.toLong(), { buf -> stream.read(buf) },
+                        onProgress = { sent ->
+                            uploading = "Uploading image…" + if (bytes.isNotEmpty()) " ${sent * 100 / bytes.size}%" else ""
+                        },
+                    )
+                    when (result) {
+                        ImageUpload.Result.Unsupported -> Toast.makeText(context, "This server can't take images yet", Toast.LENGTH_LONG).show()
+                        is ImageUpload.Result.Failed -> Toast.makeText(context, "Couldn't send the image: ${result.reason}", Toast.LENGTH_LONG).show()
+                        ImageUpload.Result.Done -> Unit
+                    }
+                } finally {
+                    uploading = null
+                }
+            }
+        }
+    }
 
     val viewport = remember {
         TerminalViewport(context, RexFonts.terminal(context)).apply {
@@ -488,7 +537,7 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
                 syncing -> "Loading…"
                 // Shown ahead of a long snapshot, and usable: new output follows once it is in.
                 catchingUp -> "Catching up…"
-                else -> opening
+                else -> opening ?: uploading
             }
             StatusOverlay(
                 overlay,
@@ -554,6 +603,9 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
                 cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let(controls::paste)
             },
             onToggleTyping = { directTyping = !directTyping },
+            onAttach = terminal?.let {
+                { pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+            },
             overlay = commandsOverlay,
             waiting = waiting,
             shell = !agentPane && !isClaude,
@@ -630,6 +682,15 @@ internal fun remoteKey(code: Int, ctrl: Boolean, alt: Boolean, shift: Boolean): 
     val mods = listOfNotNull("shift".takeIf { shift }, "ctrl".takeIf { ctrl }, "alt".takeIf { alt }).joinToString("+")
     return base.copy(mods = mods, text = if (mods.isEmpty()) base.text else "")
 }
+
+/** The name the upload takes for the image: the provider's, else a plain one. */
+private fun imageName(context: Context, uri: Uri): String =
+    runCatching {
+        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (i >= 0 && c.moveToFirst()) c.getString(i) else null
+        }
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "image.png"
 
 /** Links in the terminal's text and history, newest first. */
 private fun screenLinks(terminal: RemoteTerminal): List<String> {
@@ -711,6 +772,7 @@ internal class CommandsOverlay {
  * @param shell the pane runs a shell, so the keyboard leaves case and spelling alone.
  * @param composerFocus focuses the message box, as when leaving direct typing.
  * @param onTyped is told of each change to the message box, as the user being there.
+ * @param onAttach attaches a gallery image to the pane, as a button beside the keyboard's; null hides it.
  */
 @Composable
 internal fun InputPanel(
@@ -729,6 +791,7 @@ internal fun InputPanel(
     shell: Boolean = false,
     composerFocus: FocusRequester? = null,
     onTyped: () -> Unit = {},
+    onAttach: (() -> Unit)? = null,
 ) {
     var draft by remember(blockId) {
         val saved = blockId?.let { model.drafts[it] }.orEmpty()
@@ -849,6 +912,7 @@ internal fun InputPanel(
             controls, directTyping, onPaste, onToggleTyping, shiftTab = !(isClaude && stripShown && STRIP_MODE in strip), keys = keys,
             stripShown = stripShown,
             onToggleStrip = if (isClaude) ({ model.settings.claudeStripShown.value = !stripShown }) else null,
+            onAttach = onAttach,
             enabled = ready,
         )
         if (!directTyping) {

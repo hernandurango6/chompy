@@ -4,12 +4,15 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-// Shapes from the Rex control API, revision 7. Only the fields this app reads are modelled; the
+// Shapes from the Rex control API, revision 11. Only the fields this app reads are modelled; the
 // server documents the whole API at GET /llms.txt.
 
-const val API_REVISION = 7
+const val API_REVISION = 11
+/** The oldest revision the client still speaks, so servers before [API_REVISION] keep working. */
+const val API_MIN_REVISION = 7
 const val CONTROL_PROTOCOL = "rex.control.v1"
 const val TERMINAL_SUBPROTOCOL = "rex.data.terminal.v1"
+const val BYTES_SUBPROTOCOL = "rex.data.bytes.v1"
 const val TERMINAL_CREATOR = "com.superlogical.terminal"
 const val SHELL_FLAVOR = "com.superlogical.terminal.shell"
 
@@ -158,6 +161,9 @@ data class FormatResult(val content: String = "", val id: Long? = null, val tota
 
 @Serializable
 data class TicketResult(val ticket: String, @SerialName("expires_in_ms") val expiresInMs: Long = 0)
+
+@Serializable
+data class UploadTicket(val ticket: String, @SerialName("expires_in_ms") val expiresInMs: Long = 0)
 
 @Serializable
 data class RemoteHost(

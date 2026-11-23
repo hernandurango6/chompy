@@ -1,5 +1,6 @@
 package com.jeffarese.rexmobile
 
+import com.jeffarese.rexmobile.rex.BYTES_SUBPROTOCOL
 import com.jeffarese.rexmobile.rex.CONTROL_PROTOCOL
 import com.jeffarese.rexmobile.rex.TERMINAL_CREATOR
 import com.jeffarese.rexmobile.rex.obj
@@ -27,6 +28,7 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
+import java.util.Collections
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -52,6 +54,8 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
 
     val controls = CopyOnWriteArrayList<Control>()
     val datas = CopyOnWriteArrayList<Data>()
+    /** Every upload stream opened, in order. */
+    val uploads = CopyOnWriteArrayList<Upload>()
     /** Every request's method, in order. */
     val calls = CopyOnWriteArrayList<String>()
     /** The byte ranges of redraws read through blob_read, from and to. */
@@ -64,8 +68,15 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
     @Volatile var rows = 24
     /** Whether a data connection may resume its stream, as within the server's keep time. */
     @Volatile var resumable = true
+    /** The API revision each welcome reports; servers that don't speak uploads send none. */
+    @Volatile var apiRevision: Int? = 11
     /** Whether a fresh stream's snapshot waits for [Data.endSnapshot], as a long one over a slow link does. */
     @Volatile var slowSnapshots = false
+    /** The error code upload_begin answers with, as on a server without uploads. */
+    @Volatile var uploadBeginError: String? = null
+    /** The close an upload stream sends once the empty message ends the upload. */
+    @Volatile var uploadCloseCode = 1000
+    @Volatile var uploadCloseReason = "ok"
     /** What a fresh stream starts with: by default nothing the app can read, which it redraws instead. */
     @Volatile var snapshot: ByteArray = "SNAPSHOT".toByteArray()
     /** What a fresh stream sends right after its snapshot ends, in the same burst. */
@@ -82,6 +93,7 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
     override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket =
         if (refuses(request.url)) Control(request, listener).also { it.drop() }
         else if (request.url.encodedPath.endsWith("/api/control")) Control(request, listener).also { controls += it; it.open() }
+        else if (request.header("Sec-WebSocket-Protocol") == BYTES_SUBPROTOCOL) Upload(request, listener).also { uploads += it; it.open() }
         else Data(request, listener).also { datas += it; it.open() }
 
     fun count(method: String) = calls.count { it == method }
@@ -110,6 +122,7 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
             "$TERMINAL_CREATOR.size" -> buildJsonObject { put("columns", columns); put("rows", rows) }
             "$TERMINAL_CREATOR.format" -> format(block!!, args)
             "$TERMINAL_CREATOR.blob_read" -> blobRead(args)
+            "$TERMINAL_CREATOR.upload_begin" -> return uploadBegin(args)
             else -> JsonObject(emptyMap())
         }
         return CompletableFuture.completedFuture(result)
@@ -118,6 +131,30 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
     private fun session() = buildJsonObject {
         put("session_id", "s1")
         put("label", "one")
+    }
+
+    // Uploads get a ticket only an upload stream can spend.
+    private val uploadTickets = Collections.synchronizedSet(HashSet<String>())
+    private val nextUploadTicket = AtomicLong(1)
+
+    /** An upload_begin answer: a ticket for the bytes stream, or the error an old server gives. */
+    private fun uploadBegin(args: JsonObject): CompletableFuture<JsonElement> {
+        val fail = uploadBeginError
+        if (fail != null) {
+            return CompletableFuture.failedFuture(Fail(fail, "upload_begin is not supported"))
+        }
+        val size = (args["size"] as? JsonPrimitive)?.long ?: 0
+        if (size > MAX_UPLOAD_BYTES) {
+            return CompletableFuture.failedFuture(Fail("too_large", "upload is larger than 100MiB"))
+        }
+        val ticket = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(nextUploadTicket.getAndIncrement()).putLong(0x726578L).array()
+        val encoded = Base64.getUrlEncoder().encodeToString(ticket)
+        uploadTickets += encoded
+        return CompletableFuture.completedFuture(buildJsonObject {
+            put("ticket", encoded)
+            put("expires_in_ms", 30_000)
+        })
     }
 
     private fun view() = buildJsonObject {
@@ -257,6 +294,7 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
                 "hello" -> listener.onMessage(this, buildJsonObject {
                     put("type", "welcome")
                     put("protocol", CONTROL_PROTOCOL)
+                    apiRevision?.let { put("api_revision", it) }
                     putJsonObject("client") {
                         put("id", "c1")
                         put("reconnect_token", "token")
@@ -354,12 +392,7 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
             }
         }
 
-        private fun welcome() {
-            val w = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
-            w.put(0x81.toByte()).put(ByteArray(16) { 7 })
-            w.putInt(20, 60_000).putLong(24, nonce)
-            listener.onMessage(this, w.array().toByteString())
-        }
+        private fun welcome() = listener.onMessage(this, welcomeFrame(nonce))
 
         /** Program output, or anything else on the stream. */
         fun output(bytes: ByteArray) = post { listener.onMessage(this, bytes.toByteString()) }
@@ -370,7 +403,58 @@ class FakeRex(vararg blockIds: String = arrayOf("b1")) : OkHttpClient() {
         fun message(msg: JsonObject) = output("\u001b_rex1;${nonce.toULong()};$msg\u001b\\".toByteArray())
     }
 
+    /**
+     * One upload stream: the same handshake as a terminal stream, then raw binary messages that are
+     * the file's bytes. One empty binary message ends it; the close the server then sends carries
+     * the outcome. An unknown ticket is rejected, as an expired one is.
+     */
+    inner class Upload(request: Request, listener: WebSocketListener) : Socket(request, listener) {
+        private val nonce = 0x7777L
+        private var welcomed = false
+        /** The file's bytes, per binary message. */
+        val chunks = CopyOnWriteArrayList<ByteArray>()
+        /** Whether the empty message that ends the upload has arrived. */
+        @Volatile var finished = false
+            private set
+
+        val size get() = chunks.sumOf { it.size }
+
+        override fun receive(bytes: ByteArray) {
+            if (finished) return
+            if (!welcomed) {
+                if (bytes.size == 17 && bytes[0] == 0x01.toByte()) {
+                    val ticket = Base64.getUrlEncoder().encodeToString(bytes.copyOfRange(1, 17))
+                    if (ticket in uploadTickets) {
+                        uploadTickets -= ticket
+                        welcomed = true
+                        listener.onMessage(this, welcomeFrame(nonce))
+                    } else {
+                        listener.onMessage(this, byteArrayOf(0x82.toByte(), 1).toByteString())
+                    }
+                }
+                return
+            }
+            if (bytes.isEmpty()) {
+                finished = true
+                serverClose(uploadCloseCode, uploadCloseReason)
+                return
+            }
+            chunks += bytes
+        }
+    }
+
+    /** The 32-byte WELCOME frame of a data handshake. */
+    private fun welcomeFrame(nonce: Long): ByteString {
+        val w = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+        w.put(0x81.toByte()).put(ByteArray(16) { 7 })
+        w.putInt(20, 60_000).putLong(24, nonce)
+        return w.array().toByteString()
+    }
+
     companion object {
+        /** The largest upload_begin size the server accepts: 100MiB. */
+        const val MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
         /** A program's status record, as program_status lists it. */
         fun status(id: String, state: String, title: String? = null, at: String? = null) = buildJsonObject {
             put("id", id)

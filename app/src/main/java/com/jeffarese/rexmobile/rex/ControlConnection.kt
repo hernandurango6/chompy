@@ -29,7 +29,13 @@ class RexCallException(val method: String, val error: RexErrorBody) :
 
 class ConnectionClosedException(message: String) : Exception(message)
 
-data class Welcome(val clientId: String?, val reconnectToken: String?, val resumed: Boolean)
+data class Welcome(
+    val clientId: String?,
+    val reconnectToken: String?,
+    val resumed: Boolean,
+    /** The API revision the server agreed on, when it says; servers before revision 11 don't. */
+    val revision: Int? = null,
+)
 
 interface ControlListener {
     fun onWelcome(welcome: Welcome)
@@ -65,7 +71,7 @@ class ControlConnection(
                 val hello = buildJsonObject {
                     put("type", "hello")
                     put("api_revision", API_REVISION)
-                    put("api_min_revision", API_REVISION)
+                    put("api_min_revision", API_MIN_REVISION)
                     putJsonObject("client") {
                         put("kind", "app")
                         put("platform", "other")
@@ -154,6 +160,7 @@ class ControlConnection(
                     clientId = c?.str("id"),
                     reconnectToken = c?.str("reconnect_token"),
                     resumed = (c?.get("resumed") as? JsonPrimitive)?.booleanOrNull ?: false,
+                    revision = msg.int("api_revision"),
                 )
                 welcome = w
                 listener.onWelcome(w)

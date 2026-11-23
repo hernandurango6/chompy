@@ -319,6 +319,13 @@ class AppModel(
         return t
     }
 
+    /** One uploader per host connection, which holds the base URL and the means to call. Main thread only. */
+    private val uploads = HashMap<String, ImageUpload>()
+
+    /** The uploader for [host]'s panes, kept for as long as the connection is. Main thread only. */
+    fun imageUpload(host: HostConnection): ImageUpload =
+        uploads[host.id]?.takeIf { it.host === host } ?: ImageUpload(host, http, scope).also { uploads[host.id] = it }
+
     /**
      * Start streaming a block that may be looked at next, such as the tab beside the one on screen,
      * so it shows at once. One already streaming is left where it is in the recent order, and none
