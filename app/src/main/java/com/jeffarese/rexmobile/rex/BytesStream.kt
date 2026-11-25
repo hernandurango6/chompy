@@ -55,7 +55,7 @@ class BytesStream(
                 DataHandshake.hello(getTicket())
             } catch (e: Exception) {
                 ensureActive()
-                fail(e)
+                if (!stopped) fail(e)
                 return@launch
             }
             if (!stopped) open { it.send(hello.toByteString()) }
@@ -84,11 +84,14 @@ class BytesStream(
 
     /**
      * End the upload with one empty binary message, then wait for the server's close and return its
-     * code: 1000 for a file it kept.
+     * code: 1000 for a file it kept. A server that already closed already gave its answer.
      */
     suspend fun end(): Int {
         ready.await()
-        if (!socket().send(ByteString.EMPTY)) throw ConnectionClosedException("send failed")
+        if (!closed.isCompleted && !socket().send(ByteString.EMPTY)) {
+            // A close that landed with the send is the answer itself.
+            if (!closed.isCompleted) throw ConnectionClosedException("send failed")
+        }
         return closed.await()
     }
 
@@ -138,12 +141,15 @@ class BytesStream(
                 fail(IOException(t.message ?: "connection lost", t))
             }
         })
-        synchronized(lock) { ws = socket }
+        // A stop() that landed while the socket connected already dropped nothing: cancel this one
+        // instead of keeping it alive with a spent ticket.
+        synchronized(lock) { if (!stopped) ws = socket else socket.cancel() }
     }
 
     private fun handleClose(code: Int, reason: String, welcomed: Boolean) {
         if (stopped || closed.isCompleted) return
         stopped = true
+        forgetSocket()
         // The state first, so a listener's read of it can't lose to end()'s answer.
         if (!welcomed) fail(IOException(reason.ifBlank { "closed ($code)" }))
         else {
@@ -167,6 +173,11 @@ class BytesStream(
 
     private fun dropSocket() {
         synchronized(lock) { ws.also { ws = null } }?.cancel()
+    }
+
+    /** Releases the reference to a socket that already closed, without cancelling the close reply. */
+    private fun forgetSocket() {
+        synchronized(lock) { ws = null }
     }
 
     companion object {

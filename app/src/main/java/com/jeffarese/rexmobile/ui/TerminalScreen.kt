@@ -135,7 +135,9 @@ import com.jeffarese.rexmobile.model.AppModel
 import com.jeffarese.rexmobile.model.BlockMeta
 import com.jeffarese.rexmobile.model.ConnStatus
 import com.jeffarese.rexmobile.model.ImageUpload
+import com.jeffarese.rexmobile.model.MAX_UPLOAD_BYTES
 import com.jeffarese.rexmobile.model.KeepScreenOn
+import com.jeffarese.rexmobile.rex.BytesStream
 import com.jeffarese.rexmobile.rex.ProgramStatus
 import com.jeffarese.rexmobile.rex.StreamState
 import com.jeffarese.rexmobile.rex.WindowView
@@ -222,23 +224,61 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
     val pickConn = rememberUpdatedState(conn)
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         val bid = pickBlockId.value
-        if (uri != null && bid != null && uploading == null) {
-            scope.launch {
-                val file = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }?.let { imageName(context, uri) to it }
+        when {
+            uri == null -> Unit
+            uploading != null -> Toast.makeText(context, "Wait for the upload in progress", Toast.LENGTH_SHORT).show()
+            bid != null -> model.scope.launch(Dispatchers.Main) {
+                val (name, declared) = withContext(Dispatchers.IO) { imageMeta(context, uri) }
+                if (declared != null && declared > MAX_UPLOAD_BYTES) {
+                    Toast.makeText(context, "Couldn't send the image: over the 100 MiB limit", Toast.LENGTH_LONG).show()
+                    return@launch
                 }
-                if (file == null) {
+                val input = withContext(Dispatchers.IO) {
+                    runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
+                }
+                if (input == null) {
                     Toast.makeText(context, "Couldn't read the image", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
-                val (name, bytes) = file
-                val stream = ByteArrayInputStream(bytes)
+                // The upload carries the stream's bytes out of memory, so a provider that reports no
+                // size needs the file buffered first; a bounded read keeps that within the limit.
+                var stream = input
+                var size = declared ?: -1L
+                if (size < 0) {
+                    val bytes = withContext(Dispatchers.IO) {
+                        val acc = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(BytesStream.CHUNK_BYTES)
+                        var ok = true
+                        try {
+                            while (acc.size() <= MAX_UPLOAD_BYTES) {
+                                val n = input.read(buf, 0, minOf(buf.size, (MAX_UPLOAD_BYTES + 1 - acc.size()).toInt()))
+                                if (n < 0) break
+                                if (n == 0) { ok = false; break }
+                                acc.write(buf, 0, n)
+                            }
+                        } catch (e: Exception) {
+                            ok = false
+                        }
+                        input.close()
+                        if (ok) acc.toByteArray() else null
+                    }
+                    if (bytes == null) {
+                        Toast.makeText(context, "Couldn't read the image", Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                    if (bytes.size.toLong() > MAX_UPLOAD_BYTES) {
+                        Toast.makeText(context, "Couldn't send the image: over the 100 MiB limit", Toast.LENGTH_LONG).show()
+                        return@launch
+                    }
+                    stream = ByteArrayInputStream(bytes)
+                    size = bytes.size.toLong()
+                }
                 uploading = "Uploading image…"
                 try {
                     val result = model.imageUpload(pickConn.value).upload(
-                        sid, bid, name, bytes.size.toLong(), { buf -> stream.read(buf) },
+                        sid, bid, name, size, { buf -> stream.read(buf) },
                         onProgress = { sent ->
-                            uploading = "Uploading image…" + if (bytes.isNotEmpty()) " ${sent * 100 / bytes.size}%" else ""
+                            uploading = "Uploading image…" + if (size > 0) " ${sent * 100 / size}%" else ""
                         },
                     )
                     when (result) {
@@ -248,6 +288,7 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
                     }
                 } finally {
                     uploading = null
+                    runCatching { stream.close() }
                 }
             }
         }
@@ -603,9 +644,10 @@ fun TerminalScreen(model: AppModel, target: Target, onBack: () -> Unit) {
                 cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let(controls::paste)
             },
             onToggleTyping = { directTyping = !directTyping },
-            onAttach = terminal?.let {
+            // Servers whose revision is known and too old can't take uploads; one that doesn't say gets the unsupported answer.
+            onAttach = if (terminal != null && conn.apiRevision?.let { it < 11 } != true) {
                 { pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
-            },
+            } else null,
             overlay = commandsOverlay,
             waiting = waiting,
             shell = !agentPane && !isClaude,
@@ -683,14 +725,32 @@ internal fun remoteKey(code: Int, ctrl: Boolean, alt: Boolean, shift: Boolean): 
     return base.copy(mods = mods, text = if (mods.isEmpty()) base.text else "")
 }
 
-/** The name the upload takes for the image: the provider's, else a plain one. */
-private fun imageName(context: Context, uri: Uri): String =
+/**
+ * The provider's display name and size for [uri]: the name made shell-safe — it's typed into a
+ * pane by the server — and the size null when the provider reports none.
+ */
+private fun imageMeta(context: Context, uri: Uri): Pair<String, Long?> {
+    var rawName: String? = null
+    var size: Long? = null
     runCatching {
         context.contentResolver.query(uri, null, null, null, null)?.use { c ->
-            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (i >= 0 && c.moveToFirst()) c.getString(i) else null
+            if (c.moveToFirst()) {
+                val n = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (n >= 0) rawName = c.getString(n)
+                val s = c.getColumnIndex(OpenableColumns.SIZE)
+                if (s >= 0 && !c.isNull(s)) size = c.getLong(s)
+            }
         }
-    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "image.png"
+    }
+    return sanitizeUploadName(rawName) to size?.takeIf { it >= 0 }
+}
+
+/** [name] reduced to characters a shell leaves alone, so the server can type it verbatim. */
+private fun sanitizeUploadName(name: String?): String {
+    val clean = name.orEmpty().map { if (it.isLetterOrDigit() || it == '.' || it == '_' || it == '-') it else '_' }
+        .joinToString("").replace(Regex("""\.{2,}"""), "_").trim('.', '-')
+    return if (clean.isEmpty() || clean.none { it != '_' }) "image.png" else clean.take(96)
+}
 
 /** Links in the terminal's text and history, newest first. */
 private fun screenLinks(terminal: RemoteTerminal): List<String> {

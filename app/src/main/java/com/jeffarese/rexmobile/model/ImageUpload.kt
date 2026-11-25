@@ -10,13 +10,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 
 /** The largest upload a server takes, which upload_begin declines beyond. */
-private const val MAX_BYTES = 100L * 1024 * 1024
+const val MAX_UPLOAD_BYTES = 100L * 1024 * 1024
 
 /** How long the handshake and the server's closing answer may each take. */
 private const val REPLY_MS = 15_000L
+
+/** How long one chunk may take to cross before the connection counts as stalled. */
+private const val STALL_MS = 30_000L
 
 /** Errors an upload_begin answer carries on a server that can't take uploads. */
 private val UNSUPPORTED = setOf("method_not_found", "revision_too_low")
@@ -53,7 +57,7 @@ class ImageUpload(val host: HostConnection, private val http: OkHttpClient, priv
         read: suspend (ByteArray) -> Int,
         onProgress: (Long) -> Unit = {},
     ): Result {
-        if (size > MAX_BYTES) return Result.Failed("over the 100 MiB limit")
+        if (size > MAX_UPLOAD_BYTES) return Result.Failed("over the 100 MiB limit")
         return try {
             withContext(Dispatchers.IO) { send(sessionId, blockId, name, size, read, onProgress) }
         } catch (e: TimeoutCancellationException) {
@@ -95,10 +99,13 @@ class ImageUpload(val host: HostConnection, private val http: OkHttpClient, priv
                 if (n <= 0) break
                 // Never more than the size declared, whatever the source gives.
                 val take = minOf(n, (size - sent).toInt())
-                stream.send(buffer.copyOfRange(0, take))
+                // A stalled connection would otherwise hold the upload forever: pings are off.
+                withTimeoutOrNull(STALL_MS) { stream.send(buffer.copyOfRange(0, take)) }
+                    ?: return Result.Failed("the connection stalled")
                 sent += take
                 onProgress(sent)
             }
+            if (sent != size) return Result.Failed("the source ended with ${size - sent} bytes missing")
             return if (withTimeout(REPLY_MS) { stream.end() } == 1000) Result.Done
             else Result.Failed(detail?.takeIf { it.isNotBlank() } ?: "the upload didn't finish")
         } finally {

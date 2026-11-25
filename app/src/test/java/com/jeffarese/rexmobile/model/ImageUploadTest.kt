@@ -118,6 +118,15 @@ class ImageUploadTest {
     }
 
     @Test
+    fun aSourceEndingEarlyFailsInsteadOfReportingTruncatedBytesAsDone() {
+        online()
+        // Four bytes declared, only one in the source: the stream ends before it can close truncated.
+        val result = upload("a.png", 4L, byteArrayOf(1))
+        assertTrue(result is ImageUpload.Result.Failed && result.reason.contains("missing"))
+        assertTrue(rex.uploads.none { it.finished })
+    }
+
+    @Test
     fun aNonOkCloseCodeFails() {
         online()
         rex.uploadCloseCode = 4_006
